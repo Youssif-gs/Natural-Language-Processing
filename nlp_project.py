@@ -1,3 +1,4 @@
+
 import re
 import os
 import nltk
@@ -5,88 +6,128 @@ import pickle
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import tensorflow as tf
+import fitz
 
+from nltk.corpus import stopwords
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
-    ConfusionMatrixDisplay
+    ConfusionMatrixDisplay,
+    accuracy_score,
+    f1_score,
 )
-
 from wordcloud import WordCloud
-
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Embedding, GRU, Dense, Dropout
-from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Embedding,
+    Bidirectional,
+    GRU,
+    Dense,
+    Dropout,
+    Layer,
+    Input,
+    SpatialDropout1D,
+)
 from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import to_categorical
+
+# ============================================================
+# GPU CHECK
+# ============================================================
+
+print("=" * 60)
+print("TensorFlow Version:", tf.__version__)
+print("GPU Available:", tf.config.list_physical_devices("GPU"))
+print("=" * 60)
+
 
 
 # ============================================================
 # FILE PATHS
 # ============================================================
 
-TRAIN_FILE = "BBC News Train.csv"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-OUTPUT_DIR = "outputs"
-MODEL_DIR = "models"
+TRAIN_FILE = os.path.join(BASE_DIR, "BBC News Train.csv")
+
+OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+MODEL_DIR = os.path.join(BASE_DIR, "models")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-
 # ============================================================
-# STOPWORDS
+# DOWNLOAD STOPWORDS
 # ============================================================
 
-try:
-    nltk.download("stopwords")
-    from nltk.corpus import stopwords
-    stop_words = set(stopwords.words("english"))
-except:
-    from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
-    stop_words = set(ENGLISH_STOP_WORDS)
+nltk.download("stopwords", quiet=True)
 
+stop_words = set(stopwords.words("english"))
 
 # ============================================================
 # LOAD DATASET
 # ============================================================
 
-print("Loading dataset...")
+print("\nLOADING DATASET...")
 
 df = pd.read_csv(TRAIN_FILE)
 
-print("\nDataset Preview:")
+# ============================================================
+# FIX COLUMN NAMES
+# ============================================================
+
+df.columns = [c.strip() for c in df.columns]
+
+rename_map = {}
+
+for col in df.columns:
+
+    if col.lower() == "category":
+        rename_map[col] = "Category"
+
+    if col.lower() == "text":
+        rename_map[col] = "Text"
+
+df.rename(columns=rename_map, inplace=True)
+
 print(df.head())
 
-print("\nDataset Shape:")
-print(df.shape)
-
-print("\nClass Distribution:")
-print(df["Category"].value_counts())
-
+print("\nDataset Shape:", df.shape)
 
 # ============================================================
-# CLEAN TEXT
+# TEXT preprocessing
 # ============================================================
+
 
 def clean_text(text):
+
     text = str(text).lower()
-    text = re.sub(r"[^a-zA-Z\s]", " ", text)
+
+    # keep only letters and spaces
+    text = re.sub(r"[^a-z\s]", " ", text)
+
+    # remove extra spaces
     text = re.sub(r"\s+", " ", text).strip()
 
-    words = text.split()
-    words = [word for word in words if word not in stop_words]
+    words = []
+
+    for word in text.split():
+
+        # keep meaningful words
+        if len(word) > 2 and word not in stop_words:
+            words.append(word)
 
     return " ".join(words)
-
 
 print("\nCleaning text...")
 
 df["clean_text"] = df["Text"].apply(clean_text)
-
 
 # ============================================================
 # LABEL ENCODING
@@ -94,183 +135,239 @@ df["clean_text"] = df["Text"].apply(clean_text)
 
 label_encoder = LabelEncoder()
 
-df["label_encoded"] = label_encoder.fit_transform(df["Category"])
+df["label"] = label_encoder.fit_transform(df["Category"])
 
 class_names = label_encoder.classes_
 
+NUM_CLASSES = len(class_names)
+
 print("\nClasses:")
 print(class_names)
-
 
 # ============================================================
 # TRAIN TEST SPLIT
 # ============================================================
 
-X = df["clean_text"]
-y = df["label_encoded"]
+X = df["clean_text"].values
+y = df["label"].values
 
 X_train, X_test, y_train, y_test = train_test_split(
     X,
     y,
-    test_size=0.2,
+    test_size=0.20,
     random_state=42,
-    stratify=y
+    stratify=y,
 )
 
 print("\nTraining Samples:", len(X_train))
-print("Testing Samples:", len(X_test))
-
+print("Testing Samples :", len(X_test))
 
 # ============================================================
 # TOKENIZATION
 # ============================================================
 
-MAX_WORDS = 12000
+MAX_WORDS = 15000
 MAX_LENGTH = 250
 
 tokenizer = Tokenizer(
     num_words=MAX_WORDS,
-    oov_token="<OOV>"
+    oov_token="<OOV>",  #out of vocabulary used for unknown words
 )
 
 tokenizer.fit_on_texts(X_train)
 
-X_train_sequences = tokenizer.texts_to_sequences(X_train)
-X_test_sequences = tokenizer.texts_to_sequences(X_test)
+X_train_seq = tokenizer.texts_to_sequences(X_train)
+X_test_seq = tokenizer.texts_to_sequences(X_test)
 
-X_train_padded = pad_sequences(
-    X_train_sequences,
+X_train_pad = pad_sequences(
+    X_train_seq,
     maxlen=MAX_LENGTH,
     padding="post",
-    truncating="post"
+    truncating="post",
 )
 
-X_test_padded = pad_sequences(
-    X_test_sequences,
+X_test_pad = pad_sequences(
+    X_test_seq,
     maxlen=MAX_LENGTH,
     padding="post",
-    truncating="post"
+    truncating="post",
 )
 
-
 # ============================================================
-# ONE-HOT ENCODING
-# ============================================================
-
-NUM_CLASSES = len(class_names)
-
-y_train_encoded = to_categorical(y_train, NUM_CLASSES)
-y_test_encoded = to_categorical(y_test, NUM_CLASSES)
-
-
-# ============================================================
-# BUILD GRU MODEL
+# CUSTOM ATTENTION LAYER
 # ============================================================
 
-print("\nBuilding GRU model...")
+class AttentionLayer(Layer):
 
-model = Sequential()
+    def __init__(self, **kwargs):
+        super(AttentionLayer, self).__init__(**kwargs)
 
-model.add(
-    Embedding(
-        input_dim=MAX_WORDS,
-        output_dim=128,
-        mask_zero=True
-    )
-)
+    def build(self, input_shape):
 
-model.add(
+        self.W = self.add_weight(
+            name="attention_weight",
+            shape=(input_shape[-1], 1),
+            initializer="glorot_uniform",
+            trainable=True,
+        )
+
+        self.b = self.add_weight(
+            name="attention_bias",
+            shape=(input_shape[1], 1),
+            initializer="zeros",
+            trainable=True,
+        )
+
+        super(AttentionLayer, self).build(input_shape)
+
+    def call(self, x):
+
+        # Alignment scores
+        e = tf.keras.backend.tanh(
+            tf.keras.backend.dot(x, self.W) + self.b
+        )
+
+        # Attention weights
+        a = tf.keras.backend.softmax(e, axis=1)
+
+        # Context vector
+        output = x * a
+
+        output = tf.keras.backend.sum(output, axis=1)
+
+        return output
+
+# ============================================================
+# BUILD MODEL
+# ============================================================
+
+print("\n" + "=" * 60)
+print("BUILDING MODEL")
+print("=" * 60)
+
+inputs = Input(shape=(MAX_LENGTH,))
+
+# Embedding
+x = Embedding(
+    input_dim=MAX_WORDS,
+    output_dim=128,
+    mask_zero=True,
+)(inputs)
+
+# Spatial dropout
+x = SpatialDropout1D(0.3)(x)
+
+# BiGRU
+x = Bidirectional(
     GRU(
-        128,
-        return_sequences=False
+        64,
+        return_sequences=True,
+        dropout=0.3,
+        recurrent_dropout=0.0,
     )
-)
+)(x)
 
-model.add(Dropout(0.5))
+# Attention
+x = AttentionLayer()(x)
 
-model.add(Dense(64, activation="relu"))
+# Dense layers
+x = Dropout(0.4)(x)
 
-model.add(Dropout(0.3))
+x = Dense(64, activation="relu")(x)
 
-model.add(Dense(NUM_CLASSES, activation="softmax"))
+x = Dropout(0.3)(x)
 
+outputs = Dense(
+    NUM_CLASSES,
+    activation="softmax",
+)(x)
+
+model = Model(inputs, outputs)
 
 # ============================================================
 # COMPILE MODEL
 # ============================================================
 
 model.compile(
-    loss="categorical_crossentropy",
-    optimizer="adam",
-    metrics=["accuracy"]
+    optimizer=Adam(learning_rate=1e-3),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"],
 )
 
-print("\nModel Summary:")
-model.summary()
+print(model.summary())
 
+# ============================================================
+# CALLBACKS
+# ============================================================
+
+early_stop = EarlyStopping(
+    monitor="val_accuracy",
+    patience=3,
+    restore_best_weights=True,
+    verbose=1,
+)
 
 # ============================================================
 # TRAIN MODEL
 # ============================================================
 
-print("\nTraining GRU model...")
-
-early_stop = EarlyStopping(
-    monitor="val_loss",
-    patience=3,
-    restore_best_weights=True
-)
+print("\n" + "=" * 60)
+print("TRAINING MODEL")
+print("=" * 60)
 
 history = model.fit(
-    X_train_padded,
-    y_train_encoded,
+    X_train_pad,
+    y_train,
+    validation_split=0.1,
     epochs=15,
     batch_size=32,
-    validation_split=0.1,
-    callbacks=[early_stop]
+    callbacks=[early_stop],
+    verbose=1,
 )
 
-
 # ============================================================
-# EVALUATE MODEL
+# EVALUATION
 # ============================================================
 
-print("\nEvaluating model...")
+print("\n" + "=" * 60)
+print("MODEL EVALUATION")
+print("=" * 60)
 
 loss, accuracy = model.evaluate(
-    X_test_padded,
-    y_test_encoded
+    X_test_pad,
+    y_test,
+    verbose=0,
 )
 
-print(f"\nTest Accuracy: {accuracy:.4f}")
+y_pred_prob = model.predict(X_test_pad, verbose=0)
 
+y_pred = np.argmax(y_pred_prob, axis=1)
 
-# ============================================================
-# PREDICTIONS
-# ============================================================
-
-y_pred_probabilities = model.predict(X_test_padded)
-
-y_pred = np.argmax(y_pred_probabilities, axis=1)
-
-
-# ============================================================
-# CLASSIFICATION REPORT
-# ============================================================
-
-report = classification_report(
+f1_macro = f1_score(
     y_test,
     y_pred,
-    target_names=class_names
+    average="macro",
 )
 
-print("\nClassification Report:")
-print(report)
+f1_weighted = f1_score(
+    y_test,
+    y_pred,
+    average="weighted",
+)
 
-with open(f"{OUTPUT_DIR}/classification_report.txt", "w") as file:
-    file.write(f"Accuracy: {accuracy:.4f}\n\n")
-    file.write(report)
+print(f"\nTest Accuracy : {accuracy:.4f}")
+print(f"F1 Macro      : {f1_macro:.4f}")
+print(f"F1 Weighted   : {f1_weighted:.4f}")
 
+print("\nClassification Report:\n")
+
+print(
+    classification_report(
+        y_test,
+        y_pred,
+        target_names=class_names,
+    )
+)
 
 # ============================================================
 # CONFUSION MATRIX
@@ -278,83 +375,73 @@ with open(f"{OUTPUT_DIR}/classification_report.txt", "w") as file:
 
 cm = confusion_matrix(y_test, y_pred)
 
-display = ConfusionMatrixDisplay(
+fig, ax = plt.subplots(figsize=(8, 6))
+
+ConfusionMatrixDisplay(
     confusion_matrix=cm,
-    display_labels=class_names
+    display_labels=class_names,
+).plot(
+    cmap="Blues",
+    xticks_rotation=45,
+    ax=ax,
+    colorbar=False,
 )
 
-display.plot(cmap="Blues", xticks_rotation=45)
-
-plt.title("GRU Confusion Matrix")
+plt.title("Confusion Matrix")
 
 plt.tight_layout()
 
-plt.savefig(f"{OUTPUT_DIR}/confusion_matrix.png")
-
-plt.show()
-
-
-# ============================================================
-# DATASET DISTRIBUTION
-# ============================================================
-
-df["Category"].value_counts().plot(
-    kind="bar",
-    figsize=(8, 5)
+plt.savefig(
+    os.path.join(
+        OUTPUT_DIR,
+        "confusion_matrix.png",
+    ),
+    dpi=150,
 )
 
-plt.title("Dataset Distribution")
-plt.xlabel("Topic")
-plt.ylabel("Count")
-
-plt.tight_layout()
-
-plt.savefig(f"{OUTPUT_DIR}/dataset_distribution.png")
-
 plt.show()
 
+# ============================================================
+# TRAINING CURVES
+# ============================================================
 
-# ============================================================
-# TRAINING ACCURACY CURVE
-# ============================================================
+epochs_range = range(
+    1,
+    len(history.history["accuracy"]) + 1,
+)
 
 plt.figure(figsize=(10, 5))
 
-plt.plot(history.history["accuracy"], label="Training Accuracy")
-plt.plot(history.history["val_accuracy"], label="Validation Accuracy")
+plt.plot(
+    epochs_range,
+    history.history["accuracy"],
+    label="Train Accuracy",
+)
 
-plt.title("Training vs Validation Accuracy")
+plt.plot(
+    epochs_range,
+    history.history["val_accuracy"],
+    label="Validation Accuracy",
+)
+
 plt.xlabel("Epoch")
 plt.ylabel("Accuracy")
+
+plt.title("Training vs Validation Accuracy")
+
 plt.legend()
 
 plt.tight_layout()
 
-plt.savefig(f"{OUTPUT_DIR}/training_accuracy.png")
+plt.savefig(
+    os.path.join(
+        OUTPUT_DIR,
+        "training_accuracy.png",
+    ),
+    dpi=150,
+)
 
 plt.show()
-
-
-# ============================================================
-# TRAINING LOSS CURVE
-# ============================================================
-
-plt.figure(figsize=(10, 5))
-
-plt.plot(history.history["loss"], label="Training Loss")
-plt.plot(history.history["val_loss"], label="Validation Loss")
-
-plt.title("Training vs Validation Loss")
-plt.xlabel("Epoch")
-plt.ylabel("Loss")
-plt.legend()
-
-plt.tight_layout()
-
-plt.savefig(f"{OUTPUT_DIR}/training_loss.png")
-
-plt.show()
-
 
 # ============================================================
 # WORD CLOUDS
@@ -363,177 +450,310 @@ plt.show()
 print("\nGenerating word clouds...")
 
 for topic in class_names:
+
     text = " ".join(
         df[df["Category"] == topic]["clean_text"]
     )
 
-    wordcloud = WordCloud(
+    wc = WordCloud(
         width=800,
         height=400,
-        background_color="white"
+        background_color="white",
+        max_words=100,
     ).generate(text)
 
     plt.figure(figsize=(10, 5))
-    plt.imshow(wordcloud, interpolation="bilinear")
+
+    plt.imshow(wc, interpolation="bilinear")
+
     plt.axis("off")
+
     plt.title(f"Word Cloud - {topic}")
 
     plt.tight_layout()
 
-    plt.savefig(f"{OUTPUT_DIR}/wordcloud_{topic}.png")
+    plt.savefig(
+        os.path.join(
+            OUTPUT_DIR,
+            f"wordcloud_{topic}.png",
+        ),
+        dpi=150,
+    )
 
     plt.show()
 
-
 # ============================================================
-# KEYWORD EXTRACTION
-# ============================================================
-
-print("\nExtracting keywords...")
-
-with open(f"{OUTPUT_DIR}/topic_keywords.txt", "w") as file:
-    for topic in class_names:
-        text = " ".join(
-            df[df["Category"] == topic]["clean_text"]
-        )
-
-        words = text.split()
-
-        frequency = {}
-
-        for word in words:
-            frequency[word] = frequency.get(word, 0) + 1
-
-        sorted_words = sorted(
-            frequency.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-
-        top_words = sorted_words[:10]
-
-        print(f"\n{topic} keywords:")
-
-        file.write(f"{topic}: ")
-
-        keyword_list = []
-
-        for word, freq in top_words:
-            print(word)
-            keyword_list.append(word)
-
-        file.write(", ".join(keyword_list) + "\n")
-
-
-# ============================================================
-# SIMPLE EXPLAINABILITY
-# ============================================================
-
-def explain_prediction(text, top_n=10):
-    cleaned_text = clean_text(text)
-    words = cleaned_text.split()
-
-    sequence = tokenizer.texts_to_sequences([cleaned_text])[0]
-
-    word_scores = []
-
-    for word, token_id in zip(words, sequence):
-        if token_id != 0:
-            word_scores.append((word, token_id))
-
-    word_scores = sorted(
-        word_scores,
-        key=lambda x: x[1],
-        reverse=True
-    )
-
-    important_words = word_scores[:top_n]
-
-    return important_words
-
-
-sample_text = X_test.iloc[0]
-
-important_words = explain_prediction(sample_text)
-
-with open(f"{OUTPUT_DIR}/important_words.txt", "w") as file:
-    file.write("Important words for one sample prediction:\n\n")
-
-    for word, score in important_words:
-        file.write(f"{word}: {score}\n")
-
-print("\nImportant words saved to outputs/important_words.txt")
-
-
-# ============================================================
-# SAVE MODEL AND OBJECTS
+# SAVE MODEL
 # ============================================================
 
 print("\nSaving model...")
 
-model.save(f"{MODEL_DIR}/gru_topic_model.keras")
+model.save(
+    os.path.join(
+        MODEL_DIR,
+        "bbc_bigru_attention.keras",
+    )
+)
 
-with open(f"{MODEL_DIR}/tokenizer.pkl", "wb") as file:
-    pickle.dump(tokenizer, file)
+with open(
+    os.path.join(
+        MODEL_DIR,
+        "tokenizer.pkl",
+    ),
+    "wb",
+) as f:
 
-with open(f"{MODEL_DIR}/label_encoder.pkl", "wb") as file:
-    pickle.dump(label_encoder, file)
+    pickle.dump(tokenizer, f)
 
+with open(
+    os.path.join(
+        MODEL_DIR,
+        "label_encoder.pkl",
+    ),
+    "wb",
+) as f:
+
+    pickle.dump(label_encoder, f)
 
 # ============================================================
-# CUSTOM PREDICTION FUNCTION
+# PREDICTION FUNCTION
 # ============================================================
 
 def predict_topic(text):
+
     cleaned = clean_text(text)
 
-    sequence = tokenizer.texts_to_sequences([cleaned])
+    seq = tokenizer.texts_to_sequences([cleaned])
 
     padded = pad_sequences(
-        sequence,
+        seq,
         maxlen=MAX_LENGTH,
         padding="post",
-        truncating="post"
+        truncating="post",
     )
 
-    prediction = model.predict(padded)
+    pred = model.predict(padded, verbose=0)
 
-    predicted_class = np.argmax(prediction)
+    idx = np.argmax(pred)
 
-    predicted_topic = label_encoder.inverse_transform(
-        [predicted_class]
-    )[0]
+    topic = label_encoder.inverse_transform([idx])[0]
 
-    confidence = np.max(prediction)
+    confidence = float(np.max(pred))
 
-    return predicted_topic, confidence
+    probs = {
+        class_names[i]: float(pred[0][i])
+        for i in range(NUM_CLASSES)
+    }
+
+    return topic, confidence, probs
+
+# ============================================================
+# DEMO PREDICTIONS
+# ============================================================
+
+print("\n" + "=" * 60)
+print("CUSTOM PREDICTIONS")
+print("=" * 60)
+
+samples = [
+    (
+        "Tech",
+        "Artificial intelligence and machine learning "
+        "software are transforming technology companies."
+    ),
+
+    (
+        "Politics",
+        "The prime minister announced new economic "
+        "policies during parliament."
+    ),
+
+    (
+        "Sport",
+        "The striker scored a hat trick in the "
+        "football league final."
+    ),
+
+    (
+        "Entertainment",
+        "The movie achieved huge box office success "
+        "and streaming growth."
+    ),
+
+    (
+        "Business",
+        "Retail sales increased as consumer confidence "
+        "improved last quarter."
+    ),
+]
+
+for expected, text in samples:
+
+    topic, confidence, probs = predict_topic(text)
+
+    print(f"\n[Expected: {expected}]")
+    print("Predicted :", topic)
+    print(f"Confidence: {confidence:.2%}")
+
+    sorted_probs = sorted(
+        probs.items(),
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    print("All probs :", {
+        k: f"{v:.2%}"
+        for k, v in sorted_probs
+    })
+
+# ============================================================
+# extracting text from document
+# ============================================================
+
+import fitz 
+from docx import Document
+
+
+def extract_text_from_file(file_path):
+
+    ext = os.path.splitext(file_path)[1].lower()
+
+
+    if ext == ".txt":
+
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+
+    elif ext == ".pdf":
+
+        text = ""
+
+        pdf = fitz.open(file_path)
+
+        for page in pdf:
+
+            text += page.get_text()
+
+        pdf.close()
+
+        return text
+
+
+    elif ext == ".docx":
+
+        doc = Document(file_path)
+
+        text = "\n".join(
+            [para.text for para in doc.paragraphs]
+        )
+        return text
+
+
+    else:
+
+        raise ValueError(
+            "Unsupported file type. "
+            "Use TXT, PDF, or DOCX."
+        )
 
 
 # ============================================================
-# CUSTOM PREDICTION TEST
+# PREDICT DOCUMENT
+# ============================================================
+def predict_document(document_path):
+
+    document_path = document_path.strip()
+
+    document_path = document_path.replace('"', "")
+    document_path = document_path.replace("'", "")
+
+    document_path = os.path.normpath(document_path)
+
+    print("\nChecking file...")
+    print("Path:", document_path)
+
+
+    if not os.path.isfile(document_path):
+
+        print("\nERROR: File not found.")
+        return
+
+    try:
+
+        # ----------------------------------------------------
+        # extract text from the given file
+        # ----------------------------------------------------
+
+        text = extract_text_from_file(document_path)
+
+        # ----------------------------------------------------
+        # empty file checking
+        # ----------------------------------------------------
+
+        if len(text.strip()) == 0:
+
+            print("\nERROR: Empty document.")
+            return
+
+        # ----------------------------------------------------
+        # topic prediction
+        # ----------------------------------------------------
+
+        topic, confidence, probs = predict_topic(text)
+
+        # ----------------------------------------------------
+        # results 
+        # ----------------------------------------------------
+
+        print("\n" + "=" * 60)
+        print("DOCUMENT PREDICTION")
+        print("=" * 60)
+
+        print(f"\nDocument : {document_path}")
+
+        print(f"Predicted Category : {topic}")
+
+        print(f"Confidence : {confidence:.2%}")
+
+        print("\nClass Probabilities:")
+
+        sorted_probs = sorted(
+            probs.items(),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+
+        for cls, prob in sorted_probs:
+
+            print(f"{cls:<15} : {prob:.2%}")
+
+    except Exception as e:
+
+        print("\nERROR:")
+        print(str(e))
+
+
+# ============================================================
+# extra input not from the dataset
 # ============================================================
 
-print("\nTesting custom prediction...")
+print("\n" + "=" * 60)
+print("DOCUMENT CLASSIFIER")
+print("=" * 60)
 
-custom_text = """
-Artificial intelligence, software systems, mobile applications, internet platforms,
-and data analysis tools are transforming modern technology companies.
-"""
+document_path = input(
+    "\nEnter document path: "
+)
 
-predicted_topic, confidence = predict_topic(custom_text)
-
-print("\nCustom Text:")
-print(custom_text)
-
-print("\nPredicted Topic:")
-print(predicted_topic)
-
-print(f"Confidence: {confidence:.4f}")
-
+predict_document(document_path)
 
 # ============================================================
-# FINISHED
+# finallllyyy
 # ============================================================
 
-print("\nThe project run completed successfully.")
-print("Check outputs folder :)")
+print("\n" + "=" * 60)
+print("PROJECT COMPLETED SUCCESSFULLY :)")
+print(f"Outputs saved to: {OUTPUT_DIR}")
+print(f"Models saved to : {MODEL_DIR}")
+print("=" * 60)
